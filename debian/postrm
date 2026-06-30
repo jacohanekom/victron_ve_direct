@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+case "$1" in
+    remove)
+        rm -f /lib/systemd/system/victron-ve-direct.service
+        systemctl daemon-reload || true
+        ;;
+    purge)
+        rm -f /lib/systemd/system/victron-ve-direct.service
+        rm -f /usr/lib/systemd/system/victron-ve-direct.service
+        systemctl daemon-reload || true
+        # Remove system user
+        if id -u victron-ve-direct > /dev/null 2>&1; then
+            deluser --system victron-ve-direct || true
+        fi
+        # Remove config and state
+        rm -rf /etc/victron-ve-direct || true
+        ;;
+esac
+#DEBHELPER#
+exit 0

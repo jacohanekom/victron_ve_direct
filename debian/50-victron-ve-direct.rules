@@ -1,0 +1,25 @@
+# udev rules for Victron Energy VE.Direct USB interfaces
+#
+# Creates a stable symlink /dev/victron-serial pointing to the
+# Victron VE.Direct USB adapter regardless of enumeration order.
+# Update config.ini: port = /dev/victron-serial
+#
+# Chips used by Victron VE.Direct USB cables:
+#   FTDI FT232R  (most VE.Direct-to-USB cables)
+#   SiLabs CP210x (some newer models)
+
+# FTDI FT232R — Victron VE.Direct USB (VID=0403, PID=6001)
+SUBSYSTEM=="tty", \
+    ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", \
+    ATTRS{product}=="VE Direct cable", \
+    SYMLINK+="victron-serial", \
+    TAG+="systemd", \
+    ENV{SYSTEMD_WANTS}="victron-ve-direct.service"
+
+# SiLabs CP210x — some Victron USB adapters (VID=10c4, PID=ea60)
+SUBSYSTEM=="tty", \
+    ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", \
+    ATTRS{product}=="VE Direct cable", \
+    SYMLINK+="victron-serial", \
+    TAG+="systemd", \
+    ENV{SYSTEMD_WANTS}="victron-ve-direct.service"

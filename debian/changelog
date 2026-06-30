@@ -1,0 +1,9 @@
+victron-ve-direct (1.0.0+202606291200-1) stable; urgency=low
+
+  * Initial release.
+  * VE.Direct text-protocol parser with checksum validation.
+  * JSON broadcast over TCP with SI-scaled fields and enum name decoding.
+  * Auto-reconnect on USB disconnect.
+  * Supports SmartSolar/BlueSolar MPPT, BMV-700/702/712, Phoenix Inverter.
+
+ -- Jaco Hanekom <jhanekom@gmail.com>  Sun, 29 Jun 2026 12:00:00 +0000

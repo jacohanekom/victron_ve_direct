@@ -1,0 +1,39 @@
+#!/bin/sh
+set -e
+case "$1" in
+    configure)
+        # Create system user if it does not exist
+        if ! id -u victron-ve-direct > /dev/null 2>&1; then
+            adduser --system --no-create-home --group \
+                    --home /nonexistent \
+                    --shell /usr/sbin/nologin \
+                    victron-ve-direct
+        fi
+
+        # Grant serial port access (dialout group)
+        if getent group dialout > /dev/null 2>&1; then
+            usermod -aG dialout victron-ve-direct
+        fi
+
+        # Lock down config (may contain sensitive device paths)
+        chown root:victron-ve-direct /etc/victron-ve-direct/config.ini
+        chmod 640 /etc/victron-ve-direct/config.ini
+
+        # Reload udev rules so the serial symlink is created immediately
+        udevadm control --reload-rules 2>/dev/null || true
+        udevadm trigger --subsystem-match=tty 2>/dev/null || true
+        ;;
+esac
+#DEBHELPER#
+
+echo ""
+echo "victron-ve-direct installed."
+echo "  Edit config : /etc/victron-ve-direct/config.ini"
+echo "                Set device.port to your serial adapter, e.g.:"
+echo "                  port = /dev/ttyUSB0        (generic)"
+echo "                  port = /dev/victron-serial  (udev symlink, if matched)"
+echo "  Enable      : systemctl enable --now victron-ve-direct"
+echo "  Stream data : nc 127.0.0.1 8563"
+echo "  Status      : echo status | nc 127.0.0.1 8562"
+echo ""
+exit 0

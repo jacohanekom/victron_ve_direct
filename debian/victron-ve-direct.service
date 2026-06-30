@@ -1,0 +1,31 @@
+[Unit]
+Description=Victron Energy VE.Direct USB telemetry publisher
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=victron-ve-direct
+Group=victron-ve-direct
+
+ExecStart=/usr/bin/victron_ve_direct --config /etc/victron-ve-direct/config.ini
+
+Restart=on-failure
+RestartSec=5
+
+# Serial port access
+SupplementaryGroups=dialout
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=false
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=victron-ve-direct
+
+[Install]
+WantedBy=multi-user.target
