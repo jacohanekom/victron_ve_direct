@@ -595,8 +595,13 @@ public:
         std::vector<int> alive;
         for (int fd : clients_) {
             ssize_t n = ::send(fd, msg.data(), msg.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
-            if (n > 0 || (n < 0 && errno == EAGAIN)) alive.push_back(fd);
-            else ::close(fd);
+            if (n > 0 || (n < 0 && errno == EAGAIN)) {
+                alive.push_back(fd);
+            } else {
+                std::cerr << "\n[Data] Client fd=" << fd
+                          << " dropped: " << strerror(errno) << "\n";
+                ::close(fd);
+            }
         }
         clients_ = std::move(alive);
     }
