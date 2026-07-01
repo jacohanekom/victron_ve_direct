@@ -244,6 +244,18 @@ public:
 
 private:
     void process_line() {
+        // HEX mode frames (e.g. ":A0011\n") have no tab and poison sum_.
+        // Discard the partial text frame and restart so the next text frame
+        // gets a clean checksum accumulation.
+        if (!line_.empty() && line_[0] == ':') {
+            if (!current_.empty())
+                std::cerr << "[Parser] HEX frame mid-text, resetting ("
+                          << current_.size() << " fields lost)\n";
+            current_.clear();
+            sum_ = 0;
+            return;
+        }
+
         auto tab = line_.find('\t');
         if (tab == std::string::npos) return;
 
@@ -256,6 +268,10 @@ private:
             // \r\n terminator of the Checksum line.  Our running sum_ has
             // already consumed those two bytes, so subtract them back.
             bool valid = ((sum_ - '\r' - '\n') & 0xFF) == 0;
+            if (!valid)
+                std::cerr << "[Parser] checksum FAIL sum=0x"
+                          << std::hex << ((sum_ - '\r' - '\n') & 0xFF)
+                          << std::dec << " fields=" << current_.size() << "\n";
             if (valid && !current_.empty() && on_frame)
                 on_frame(current_);
             current_.clear();
