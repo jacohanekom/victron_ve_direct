@@ -263,11 +263,10 @@ private:
         const std::string val = line_.substr(tab + 1);
 
         if (key == "Checksum") {
-            // The VE.Direct checksum covers all bytes from the start of the
-            // frame up to and including the checksum value byte, but NOT the
-            // \r\n terminator of the Checksum line.  Our running sum_ has
-            // already consumed those two bytes, so subtract them back.
-            bool valid = ((sum_ - '\r' - '\n') & 0xFF) == 0;
+            // VE.Direct checksum: the device chooses the checksum byte so that
+            // the sum of ALL bytes in the frame (including every \r\n, including
+            // the \r\n after the checksum byte itself) equals 0 mod 256.
+            bool valid = (sum_ == 0);
             if (!valid)
                 std::cerr << "[Parser] checksum FAIL sum=0x"
                           << std::hex << ((sum_ - '\r' - '\n') & 0xFF)
