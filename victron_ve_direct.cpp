@@ -57,6 +57,7 @@
 #include <unistd.h>
 
 #include "config.hpp"
+#include "mdns.hpp"
 
 using Clock = std::chrono::steady_clock;
 
@@ -729,11 +730,13 @@ int main(int argc, char** argv) {
 
     Config cfg(cfg_path);
 
-    const std::string device    = cfg.get_str("device.port", "/dev/ttyUSB0");
-    const int         baud      = cfg.get_int("device.baud", 19200);
-    const int         ctrl_port = cfg.get_int("output.ctrl_port", 8562);
-    const int         data_port = cfg.get_int("output.data_port", 8563);
-    const int         retry_s   = cfg.get_int("device.retry_secs", 5);
+    const std::string device       = cfg.get_str("device.port", "/dev/ttyUSB0");
+    const int         baud         = cfg.get_int("device.baud", 19200);
+    const int         ctrl_port    = cfg.get_int("output.ctrl_port", 8562);
+    const int         data_port    = cfg.get_int("output.data_port", 8563);
+    const int         retry_s      = cfg.get_int("device.retry_secs", 5);
+    const bool        mdns_enabled = cfg.get_bool("mdns.enabled", true);
+    const std::string mdns_name    = cfg.get_str("mdns.name", "victron-ve-direct");
 
     {
         std::lock_guard<std::mutex> lk(g_status.mu);
@@ -742,13 +745,20 @@ int main(int argc, char** argv) {
 
     std::cerr << "[Config] device  : " << device << "  baud=" << baud << "\n"
               << "[Config] status  : 0.0.0.0:" << ctrl_port << "\n"
-              << "[Config] data    : 0.0.0.0:" << data_port << "\n";
+              << "[Config] data    : 0.0.0.0:" << data_port << "\n"
+              << "[Config] mdns    : " << (mdns_enabled ? mdns_name : "disabled") << "\n";
 
     // ── Servers ───────────────────────────────────────────────────────────────
     DataServer   data_srv(data_port);
     StatusServer status_srv(ctrl_port);
     data_srv.start();
     status_srv.start();
+
+    MdnsAnnouncer mdns(mdns_name, {
+        {"_victron-data._tcp",   static_cast<uint16_t>(data_port)},
+        {"_victron-status._tcp", static_cast<uint16_t>(ctrl_port)},
+    });
+    if (mdns_enabled) mdns.start();
 
     std::cerr << "[Main] Running.\n"
               << "[Main]   Data stream : nc 127.0.0.1 " << data_port << "\n"

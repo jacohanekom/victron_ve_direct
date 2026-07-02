@@ -62,9 +62,20 @@ One object per VE.Direct frame, emitted on stdout and broadcast to all connected
 
 All voltages are in V, currents in A, power in W, energy in kWh. Enum fields (`CS`, `MPPT`, `ERR`) include a `_name` companion string. Any fields not recognised by the formatter are collected into a `"raw"` object so no data is silently dropped.
 
+## Discovery (mDNS/DNS-SD)
+
+On startup the process announces both TCP ports on the LAN via Avahi, so you don't need to know its IP:
+
+```bash
+avahi-browse -rt _victron-data._tcp
+avahi-browse -rt _victron-status._tcp
+```
+
+This needs `avahi-daemon` running on the Pi (installed and enabled by default on Raspberry Pi OS). If it isn't running, `victron_ve_direct` logs a warning at startup and continues normally — mDNS is discovery-only, not required for the TCP protocol to work. Disable it or change the advertised name via the `[mdns]` section in `config.ini`.
+
 ## Build
 
-Requires a C++20 compiler and CMake 3.16+.
+Requires a C++20 compiler, CMake 3.16+, `pkg-config`, and Avahi client development headers (`libavahi-client-dev` on Debian/Raspberry Pi OS).
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release
@@ -100,6 +111,10 @@ retry_secs  = 5              ; wait before reconnect after disconnect
 [output]
 ctrl_port   = 8562
 data_port   = 8563
+
+[mdns]
+enabled     = true                ; announce _victron-data._tcp / _victron-status._tcp via avahi-daemon
+name        = victron-ve-direct   ; service instance name shown in discovery
 ```
 
 The VE.Direct protocol is always 19200 8N1 — do not change the baud rate.

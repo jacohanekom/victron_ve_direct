@@ -3,13 +3,16 @@ Section: misc
 Priority: optional
 Maintainer: Jaco Hanekom <jhanekom@gmail.com>
 Build-Depends: debhelper-compat (= 13),
-               cmake
+               cmake,
+               pkg-config,
+               libavahi-client-dev
 Standards-Version: 4.6.2
 Rules-Requires-Root: no
 
 Package: victron-ve-direct
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: avahi-daemon
 Description: Victron Energy VE.Direct USB telemetry publisher
  Reads a Victron Energy device (SmartSolar MPPT, BMV battery monitor,
  Phoenix Inverter) via the VE.Direct serial-text protocol over USB and
@@ -17,8 +20,10 @@ Description: Victron Energy VE.Direct USB telemetry publisher
  .
  Supports auto-reconnect on USB disconnect, checksum-validated frame
  parsing, and human-readable enum decoding for charge state, MPPT
- tracker mode and error codes.
+ tracker mode and error codes. Announces itself on the LAN via mDNS/DNS-SD
+ when avahi-daemon is available.
  .
  Data stream  : TCP :<8563>  (newline-delimited JSON)
  Status query : TCP :<8562>  (echo status | nc localhost 8562)
+ Discovery    : mDNS/DNS-SD, service types _victron-data._tcp / _victron-status._tcp
  Config       : /etc/victron-ve-direct/config.ini
