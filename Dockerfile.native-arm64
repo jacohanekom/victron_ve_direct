@@ -1,0 +1,52 @@
+# Builds the victron-ve-direct Debian package NATIVELY for arm64, using
+# a real arm64 Docker daemon (e.g. colima on Apple Silicon, which runs a
+# genuine arm64 Linux VM — no QEMU emulation involved despite the host
+# being a Mac). Same approach as the sibling picam-raw/picam-hailo/
+# picam-orchestrator-go/picam-frontend-go/mp3-player/pi-fan-control/
+# picam-recorder projects' Dockerfile.native-arm64.
+#
+# Every build dependency here (cmake, pkg-config, libavahi-client-dev) is
+# a plain Debian package — no Raspberry Pi-specific repo needed at all.
+# Proper debhelper-based build (unlike picam-recorder), so
+# ${shlibs:Depends} is computed correctly by dh_shlibdeps automatically —
+# no manual dependency-list surgery needed here.
+#
+# Usage (from this directory, on a genuinely arm64 Docker host):
+#   docker build --platform linux/arm64 -f Dockerfile.native-arm64 -t victron-ve-direct-builder .
+#   docker create --name victron-ve-direct-extract victron-ve-direct-builder
+#   docker cp victron-ve-direct-extract:/out ./dist
+#   docker rm victron-ve-direct-extract
+
+FROM debian:bookworm-slim AS build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        debhelper \
+        devscripts \
+        cmake \
+        pkg-config \
+        libavahi-client-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+# Stamp a build-time version (base version + UTC date/time as a Debian
+# local-version suffix — see picam-orchestrator-go/Dockerfile.native-arm64
+# for the rationale). Timestamp is a plain contiguous digit run
+# (YYYYMMDDHHMMSS, no separator): this project's changelog already embeds
+# a compact undotted timestamp (1.0.0+202606291200-1), and dpkg compares
+# maximal digit runs as arbitrary-precision integers — a dot would end
+# that run early and make a chronologically later build compare as an
+# EARLIER version (confirmed the hard way while building picam-raw).
+RUN set -e; \
+    BASEVER="$(dpkg-parsechangelog -S Version | sed -E 's/\+.*//')"; \
+    TS="$(date -u +%Y%m%d%H%M%S)"; \
+    DEBEMAIL="jhanekom@gmail.com" DEBFULLNAME="Jaco Hanekom" \
+        dch --newversion "${BASEVER}+${TS}-1" --distribution stable --force-distribution \
+        "Automated native arm64 build (UTC ${TS})."; \
+    dpkg-buildpackage -us -uc -b
+
+# Build artifacts land one directory above the source tree by default
+# for "3.0 (native)" format source packages.
+RUN mkdir -p /out && cp /*.deb /*.changes /*.buildinfo /out/ 2>/dev/null || cp /*.deb /out/
