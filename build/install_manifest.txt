@@ -1,2 +1,0 @@
-/tmp/vedirect-pkg-test/bin/victron_ve_direct
-/tmp/vedirect-pkg-test/share/victron-ve-direct/config.ini
