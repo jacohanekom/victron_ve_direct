@@ -15,7 +15,7 @@ Reads a Victron Energy device over the VE.Direct serial-text protocol (USB-to-se
 | Port | Protocol | Description |
 |------|----------|-------------|
 | 8563 | TCP | Data stream — one newline-delimited JSON line per frame |
-| 8562 | TCP | Status query — send `status\n`, get a key=value reply |
+| 8562 | TCP | Control — one command per connection, key=value reply |
 
 ```bash
 # Stream live telemetry
@@ -24,6 +24,76 @@ nc 127.0.0.1 8563
 # Query status
 echo status | nc 127.0.0.1 8562
 ```
+
+## Device settings (VictronConnect parameters)
+
+The control port can read and write the same settings VictronConnect exposes
+(charger voltages, battery type, load output, BMV battery settings, inverter
+setpoints, …), using the VE.Direct HEX protocol on the same serial line.
+
+| Command | Description |
+|---------|-------------|
+| `status` | telemetry snapshot (unchanged) |
+| `settings` | read every register the connected device supports |
+| `list` | show the register catalogue: name, id, type, rw/ro, unit |
+| `get <name\|0xRRRR>` | read one register |
+| `set <name> <value>` | write one register, value in engineering units |
+| `setraw <0xRRRR> <u8\|u16\|s16\|u32\|s32> <int>` | write any register by raw id |
+| `ping` | HEX ping, returns app version |
+| `restart` | reboot the device |
+| `help` | command summary |
+
+```bash
+# Read all settings the device supports
+echo settings | nc 127.0.0.1 8562
+
+# Absorption voltage → 14.40 V
+echo 'set absorption_voltage 14.40' | nc 127.0.0.1 8562
+
+# Battery type → LiFePO4 preset
+echo 'set battery_type 8' | nc 127.0.0.1 8562
+
+# Load output → always on
+echo 'set load_mode 4' | nc 127.0.0.1 8562
+
+# Any register not in the catalogue, by raw id
+echo 'setraw 0xED2E u16 10' | nc 127.0.0.1 8562
+```
+
+Replies are `ok=true` with the value the device actually stored (the device
+echoes it back), or `ok=false` with an error line. Values the device rejects
+come back as `parameter error (value out of range)` — range validation is
+done by the charger itself, exactly as with VictronConnect.
+
+Notes:
+
+- After a HEX command the device pauses its text telemetry for a few seconds;
+  the JSON stream resumes automatically.
+- Writes can be disabled with `allow_set = false` in the `[control]` section
+  of `config.ini` (reads stay available). The control port listens on
+  `0.0.0.0`, so consider this on shared networks.
+- Settings not applicable to a model are reported by the device itself and
+  silently skipped in `settings` output.
+
+Supported named registers, per device class:
+
+- **MPPT**: `battery_voltage`, `max_charge_current`, `battery_type`,
+  `absorption_voltage`, `float_voltage`, `equalisation_voltage`,
+  `temp_compensation`, `batterysafe_mode`, `adaptive_mode`,
+  `auto_equalise_mode`, `bulk_time_limit`, `absorption_time_limit`,
+  `tail_current`, `low_temp_charge_current`, `auto_eq_stop_on_voltage`,
+  `equalisation_current`, `equalisation_duration`, `rebulk_voltage_offset`,
+  `low_temp_level`, `bms_present`, `load_mode`, `load_switch_low_level`,
+  `load_switch_high_level`, `device_mode`
+- **BMV**: `battery_capacity`, `charged_voltage`, `tail_current_pct`,
+  `charged_detection_time`, `charge_efficiency`, `peukert_coefficient`,
+  `current_threshold`, `ttg_delta_t`, `discharge_floor`, `relay_low_soc_clear`
+- **Phoenix Inverter**: `device_mode`, `ac_out_voltage_setpoint`,
+  `alarm_low_voltage_set`, `alarm_low_voltage_clear`
+
+Run `echo list | nc 127.0.0.1 8562` for the full annotated catalogue. A
+simulated-device integration test lives in `test/run_test.sh` (needs no
+hardware — it fakes an MPPT on a PTY).
 
 ## JSON output
 

@@ -6,7 +6,12 @@
  * over TCP — mirroring the picam-hailo network interface exactly.
  *
  *   DataServer   TCP data_port=8563  newline-delimited JSON, one per frame
- *   StatusServer TCP ctrl_port=8562  key=value reply to "status\n"
+ *   StatusServer TCP ctrl_port=8562  key=value replies to line commands:
+ *                status | settings | list | get <reg> | set <reg> <value> |
+ *                setraw <0xRRRR> <type> <int> | ping | restart | help
+ *
+ * Settings (the same parameters VictronConnect exposes) are read/written via
+ * the VE.Direct HEX protocol — see vedirect_hex.hpp.
  *
  * JSON output (stdout + DataServer broadcast):
  *   {"ts_us":T,"frame":N,
@@ -58,6 +63,7 @@
 
 #include "config.hpp"
 #include "mdns.hpp"
+#include "vedirect_hex.hpp"
 
 using Clock = std::chrono::steady_clock;
 
@@ -226,10 +232,38 @@ class VeDirectParser {
 public:
     using FrameCallback = std::function<void(
         const std::map<std::string, std::string>&)>;
+    // Called for every syntactically valid HEX frame (checksum verified):
+    // rsp = command/response nibble, data = payload bytes (checksum stripped)
+    using HexCallback = std::function<void(
+        uint8_t, const std::vector<uint8_t>&)>;
 
     FrameCallback on_frame;
+    HexCallback   on_hex;
 
     void feed(uint8_t byte) {
+        // HEX frames (":<cmd><data><check>\n") may interrupt a text frame at
+        // any point.  Per the VE.Direct spec they are excluded from the text
+        // checksum, and the interrupted text frame resumes afterwards.
+        if (in_hex_) {
+            if (byte == '\n') {
+                process_hex();
+                hex_line_.clear();
+                in_hex_ = false;
+            } else if (byte != '\r') {
+                hex_line_ += static_cast<char>(byte);
+                if (hex_line_.size() > 512) {   // runaway guard
+                    hex_line_.clear();
+                    in_hex_ = false;
+                }
+            }
+            return;
+        }
+        if (byte == ':') {
+            in_hex_ = true;
+            hex_line_.clear();
+            return;
+        }
+
         sum_ = (sum_ + byte) & 0xFF;
         if (byte == '\n') {
             if (!line_.empty() && line_.back() == '\r')
@@ -241,22 +275,23 @@ public:
         }
     }
 
-    void reset() { line_.clear(); current_.clear(); sum_ = 0; }
+    void reset() {
+        line_.clear(); current_.clear(); sum_ = 0;
+        hex_line_.clear(); in_hex_ = false;
+    }
 
 private:
-    void process_line() {
-        // HEX mode frames (e.g. ":A0011\n") have no tab and poison sum_.
-        // Discard the partial text frame and restart so the next text frame
-        // gets a clean checksum accumulation.
-        if (!line_.empty() && line_[0] == ':') {
-            if (!current_.empty())
-                std::cerr << "[Parser] HEX frame mid-text, resetting ("
-                          << current_.size() << " fields lost)\n";
-            current_.clear();
-            sum_ = 0;
+    void process_hex() {
+        uint8_t cmd;
+        std::vector<uint8_t> data;
+        if (!vehex::parse_frame(hex_line_, cmd, data)) {
+            std::cerr << "[Parser] bad HEX frame: \":" << hex_line_ << "\"\n";
             return;
         }
+        if (on_hex) on_hex(cmd, data);
+    }
 
+    void process_line() {
         auto tab = line_.find('\t');
         if (tab == std::string::npos) return;
 
@@ -282,6 +317,8 @@ private:
     }
 
     std::string                        line_;
+    std::string                        hex_line_;
+    bool                               in_hex_ = false;
     std::map<std::string, std::string> current_;
     int                                sum_ = 0;
 };
@@ -486,11 +523,82 @@ struct VictronStatus {
 static VictronStatus g_status;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// StatusServer — TCP plain-text on ctrl_port (identical pattern to picam-hailo)
+// Setting-value enum decoders (mirrors VictronConnect labels)
+// ─────────────────────────────────────────────────────────────────────────────
+static const char* battery_type_name(int v) {
+    switch (v) {
+        case 1:   return "Gel Victron long life (14.1V)";
+        case 2:   return "Gel Victron deep discharge (14.3V)";
+        case 3:   return "Gel Victron deep discharge (14.4V)";
+        case 4:   return "AGM Victron deep discharge (14.7V)";
+        case 5:   return "Tubular plate cyclic mode 1 (14.9V)";
+        case 6:   return "Tubular plate cyclic mode 2 (15.1V)";
+        case 7:   return "Tubular plate cyclic mode 3 (15.3V)";
+        case 8:   return "LiFePO4 (14.2V)";
+        case 255: return "User defined";
+        default:  return "Unknown";
+    }
+}
+
+static const char* load_mode_name(int v) {
+    switch (v) {
+        case 0:  return "Off";
+        case 1:  return "Auto (BatteryLife)";
+        case 2:  return "Alternative 1";
+        case 3:  return "Alternative 2";
+        case 4:  return "Always on";
+        case 5:  return "User defined 1 (off < low, on > high)";
+        case 6:  return "User defined 2 (on between low and high)";
+        case 7:  return "Automatic energy selector (AES)";
+        default: return "Unknown";
+    }
+}
+
+static const char* device_mode_name(int v) {
+    switch (v) {
+        case 1:  return "Charger on";
+        case 2:  return "Inverter on";
+        case 4:  return "Off";
+        case 5:  return "Eco";
+        default: return "Unknown";
+    }
+}
+
+// Format raw register value as "value[ unit][ (label)]"
+static std::string format_reg_value(const vehex::RegDef& r,
+                                    const std::vector<uint8_t>& raw) {
+    int64_t v = vehex::decode_value(raw, r.type);
+    char buf[96];
+    if (r.scale == 1.0)
+        snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(v));
+    else
+        snprintf(buf, sizeof(buf), "%.3f", v * r.scale);
+    std::string out = buf;
+    if (r.unit[0]) { out += ' '; out += r.unit; }
+
+    const char* label = nullptr;
+    if      (!strcmp(r.name, "battery_type")) label = battery_type_name(static_cast<int>(v));
+    else if (!strcmp(r.name, "load_mode"))    label = load_mode_name(static_cast<int>(v));
+    else if (!strcmp(r.name, "device_mode"))  label = device_mode_name(static_cast<int>(v));
+    else if (!strcmp(r.name, "device_state")) label = cs_name(static_cast<int>(v));
+    if (label) { out += " ("; out += label; out += ')'; }
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// StatusServer — TCP plain-text on ctrl_port.
+//   status                       existing key=value status dump
+//   settings                     read every register the device supports
+//   list                         show the register catalogue
+//   get <name|0xRRRR>            read one setting
+//   set <name> <value>           write one setting (engineering units)
+//   setraw <0xRRRR> <u8|u16|s16|u32|s32> <int>   raw register write
+//   ping / restart               HEX ping / device reboot
 // ─────────────────────────────────────────────────────────────────────────────
 class StatusServer {
 public:
-    explicit StatusServer(int port) : port_(port) {}
+    StatusServer(int port, vehex::HexBus* bus, bool allow_set)
+        : port_(port), bus_(bus), allow_set_(allow_set) {}
     ~StatusServer() { if (fd_ >= 0) ::close(fd_); }
 
     void start() {
@@ -513,11 +621,201 @@ private:
         while (!g_stop) {
             int cfd = ::accept(fd_, nullptr, nullptr);
             if (cfd < 0) { if (errno == EINTR) continue; break; }
-            std::thread([cfd]{ handle(cfd); }).detach();
+            std::thread([this, cfd]{ handle(cfd); }).detach();
         }
     }
 
-    static void handle(int cfd) {
+    // Split a command line into whitespace-separated tokens
+    static std::vector<std::string> tokenize(const std::string& s) {
+        std::vector<std::string> out;
+        std::istringstream iss(s);
+        std::string t;
+        while (iss >> t) out.push_back(t);
+        return out;
+    }
+
+    // Resolve "<name>" or "0xRRRR" to a register.  For raw hex ids without a
+    // catalogue entry, a synthetic read-only U32 entry is returned via `tmp`.
+    static const vehex::RegDef* resolve(const std::string& arg,
+                                        vehex::RegDef& tmp) {
+        if (const auto* r = vehex::find_register(arg)) return r;
+        if (arg.rfind("0x", 0) == 0 || arg.rfind("0X", 0) == 0) {
+            try {
+                unsigned long id = std::stoul(arg, nullptr, 16);
+                if (id > 0xFFFF) return nullptr;
+                if (const auto* r = vehex::find_register(
+                        static_cast<uint16_t>(id))) return r;
+                tmp = {"raw", static_cast<uint16_t>(id), vehex::VType::U32,
+                       1.0, "", false, vehex::DEV_ALL, ""};
+                return &tmp;
+            } catch (...) { return nullptr; }
+        }
+        return nullptr;
+    }
+
+    std::string cmd_get(const std::vector<std::string>& tok) {
+        if (tok.size() != 2) return "ok=false\nerror=usage: get <name|0xRRRR>\n";
+        vehex::RegDef tmp{};
+        const auto* r = resolve(tok[1], tmp);
+        if (!r) return "ok=false\nerror=unknown register '" + tok[1] + "' (try: list)\n";
+
+        auto res = bus_->get(r->reg);
+        if (!res.ok) return "ok=false\nregister=" + std::string(r->name)
+                          + "\nerror=" + res.error + "\n";
+
+        char hexid[16];
+        snprintf(hexid, sizeof(hexid), "0x%04X", r->reg);
+        std::string reply = "ok=true\nregister=" + std::string(r->name)
+                          + "\nid=" + hexid
+                          + "\nvalue=" + format_reg_value(*r, res.value)
+                          + "\nraw=";
+        char b[8];
+        for (uint8_t byte : res.value) {
+            snprintf(b, sizeof(b), "%02X", byte);
+            reply += b;
+        }
+        reply += "\n";
+        return reply;
+    }
+
+    std::string cmd_set(const std::vector<std::string>& tok) {
+        if (!allow_set_)
+            return "ok=false\nerror=set disabled in config (control.allow_set)\n";
+        if (tok.size() != 3) return "ok=false\nerror=usage: set <name> <value>\n";
+
+        const auto* r = vehex::find_register(tok[1]);
+        if (!r) return "ok=false\nerror=unknown setting '" + tok[1]
+                     + "' (raw ids: use setraw)\n";
+        if (!r->writable)
+            return "ok=false\nerror=register '" + tok[1] + "' is read-only\n";
+
+        double eng;
+        try { eng = std::stod(tok[2]); }
+        catch (...) { return "ok=false\nerror=invalid value '" + tok[2] + "'\n"; }
+
+        // engineering → raw, round to nearest step
+        int64_t raw = static_cast<int64_t>(
+            eng / r->scale + (eng >= 0 ? 0.5 : -0.5));
+
+        auto res = bus_->set(r->reg, vehex::encode_value(raw, r->type));
+        if (!res.ok) return "ok=false\nregister=" + std::string(r->name)
+                          + "\nerror=" + res.error + "\n";
+
+        // Device echoes the value it actually stored — report that back
+        return "ok=true\nregister=" + std::string(r->name)
+             + "\nvalue=" + format_reg_value(*r, res.value) + "\n";
+    }
+
+    std::string cmd_setraw(const std::vector<std::string>& tok) {
+        if (!allow_set_)
+            return "ok=false\nerror=set disabled in config (control.allow_set)\n";
+        if (tok.size() != 4)
+            return "ok=false\nerror=usage: setraw <0xRRRR> <u8|u16|s16|u32|s32> <int>\n";
+
+        unsigned long id;
+        try { id = std::stoul(tok[1], nullptr, 16); }
+        catch (...) { return "ok=false\nerror=invalid register id\n"; }
+        if (id > 0xFFFF) return "ok=false\nerror=register id out of range\n";
+
+        vehex::VType t;
+        if      (tok[2] == "u8")  t = vehex::VType::U8;
+        else if (tok[2] == "u16") t = vehex::VType::U16;
+        else if (tok[2] == "s16") t = vehex::VType::S16;
+        else if (tok[2] == "u32") t = vehex::VType::U32;
+        else if (tok[2] == "s32") t = vehex::VType::S32;
+        else return "ok=false\nerror=type must be u8|u16|s16|u32|s32\n";
+
+        int64_t raw;
+        try { raw = std::stoll(tok[3], nullptr, 0); }
+        catch (...) { return "ok=false\nerror=invalid value\n"; }
+
+        auto res = bus_->set(static_cast<uint16_t>(id),
+                             vehex::encode_value(raw, t));
+        if (!res.ok) return "ok=false\nerror=" + res.error + "\n";
+        return "ok=true\n";
+    }
+
+    std::string cmd_settings() {
+        // Determine device class from last seen PID
+        int pid = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_status.mu);
+            try { if (!g_status.pid.empty()) pid = std::stoi(g_status.pid, nullptr, 0); }
+            catch (...) {}
+        }
+        uint8_t devclass = vehex::device_class_from_pid(pid);
+
+        std::string reply = "ok=true\n";
+        int read_ok = 0, skipped = 0;
+        for (const auto& r : vehex::registers()) {
+            if (!(r.devmask & devclass)) continue;
+            auto res = bus_->get(r.reg);
+            if (!res.ok) {
+                // register genuinely unsupported by this model → silently skip
+                if (res.flags & 0x03) { ++skipped; continue; }
+                reply += std::string(r.name) + "=ERROR (" + res.error + ")\n";
+                continue;
+            }
+            reply += std::string(r.name) + "=" + format_reg_value(r, res.value) + "\n";
+            ++read_ok;
+        }
+        reply += "read=" + std::to_string(read_ok)
+               + "\nunsupported=" + std::to_string(skipped) + "\n";
+        return reply;
+    }
+
+    std::string cmd_list() {
+        std::string reply = "ok=true\n";
+        char line[256];
+        for (const auto& r : vehex::registers()) {
+            const char* type =
+                r.type == vehex::VType::U8  ? "u8"  :
+                r.type == vehex::VType::U16 ? "u16" :
+                r.type == vehex::VType::S16 ? "s16" :
+                r.type == vehex::VType::U32 ? "u32" : "s32";
+            snprintf(line, sizeof(line), "%s=0x%04X %s %s%s%s -- %s\n",
+                     r.name, r.reg, type,
+                     r.writable ? "rw" : "ro",
+                     r.unit[0] ? " unit=" : "", r.unit,
+                     r.help);
+            reply += line;
+        }
+        return reply;
+    }
+
+    std::string cmd_ping() {
+        auto res = bus_->ping();
+        if (!res.ok) return "ok=false\nerror=" + res.error + "\n";
+        std::string reply = "ok=true\n";
+        if (res.value.size() >= 2) {
+            // un16 version, bit14 flags candidate/official
+            int ver = res.value[0] | (res.value[1] << 8);
+            char b[64];
+            snprintf(b, sizeof(b), "app_version=0x%04X\n", ver);
+            reply += b;
+        }
+        return reply;
+    }
+
+    std::string cmd_restart() {
+        if (!allow_set_)
+            return "ok=false\nerror=set disabled in config (control.allow_set)\n";
+        auto res = bus_->restart();
+        if (!res.ok) return "ok=false\nerror=" + res.error + "\n";
+        return "ok=true\nnote=device is rebooting\n";
+    }
+
+    static std::string cmd_help() {
+        return
+            "ok=true\n"
+            "commands=status settings list get set setraw ping restart help\n"
+            "usage_get=get <name|0xRRRR>\n"
+            "usage_set=set <name> <value>          ; engineering units, e.g. set absorption_voltage 14.40\n"
+            "usage_setraw=setraw <0xRRRR> <u8|u16|s16|u32|s32> <int>\n"
+            "note=after a hex command the device pauses text telemetry for a few seconds\n";
+    }
+
+    void handle(int cfd) {
         struct timeval tv{2, 0};
         ::setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         std::string line;
@@ -570,15 +868,29 @@ private:
                 reply += soc;
             }
         } else {
-            reply = "ok=false\nerror=unknown command\ncommands=status\n\n";
+            auto tok = tokenize(line);
+            const std::string cmd = tok.empty() ? "" : tok[0];
+            if      (cmd == "get")      reply = cmd_get(tok);
+            else if (cmd == "set")      reply = cmd_set(tok);
+            else if (cmd == "setraw")   reply = cmd_setraw(tok);
+            else if (cmd == "settings") reply = cmd_settings();
+            else if (cmd == "list")     reply = cmd_list();
+            else if (cmd == "ping")     reply = cmd_ping();
+            else if (cmd == "restart")  reply = cmd_restart();
+            else if (cmd == "help")     reply = cmd_help();
+            else reply = "ok=false\nerror=unknown command\n"
+                         "commands=status settings list get set setraw ping restart help\n";
+            reply += "\n";
         }
         ::send(cfd, reply.data(), reply.size(), MSG_NOSIGNAL);
         ::close(cfd);
     }
 
-    int         port_;
-    int         fd_ = -1;
-    std::thread thread_;
+    int             port_;
+    vehex::HexBus*  bus_;
+    bool            allow_set_;
+    int             fd_ = -1;
+    std::thread     thread_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -723,7 +1035,11 @@ int main(int argc, char** argv) {
         else if (a == "--help" || a == "-h") {
             std::cout << "Usage: " << argv[0] << " [--config config.ini]\n"
                       << "  Stream data : nc 127.0.0.1 8563\n"
-                      << "  Status      : echo status | nc 127.0.0.1 8562\n";
+                      << "  Status      : echo status | nc 127.0.0.1 8562\n"
+                      << "  Settings    : echo settings | nc 127.0.0.1 8562\n"
+                      << "  Read one    : echo 'get absorption_voltage' | nc 127.0.0.1 8562\n"
+                      << "  Write one   : echo 'set absorption_voltage 14.40' | nc 127.0.0.1 8562\n"
+                      << "  Catalogue   : echo list | nc 127.0.0.1 8562\n";
             return 0;
         }
     }
@@ -737,6 +1053,7 @@ int main(int argc, char** argv) {
     const int         retry_s      = cfg.get_int("device.retry_secs", 5);
     const bool        mdns_enabled = cfg.get_bool("mdns.enabled", true);
     const std::string mdns_name    = cfg.get_str("mdns.name", "victron-ve-direct");
+    const bool        allow_set    = cfg.get_bool("control.allow_set", true);
 
     {
         std::lock_guard<std::mutex> lk(g_status.mu);
@@ -746,11 +1063,13 @@ int main(int argc, char** argv) {
     std::cerr << "[Config] device  : " << device << "  baud=" << baud << "\n"
               << "[Config] status  : 0.0.0.0:" << ctrl_port << "\n"
               << "[Config] data    : 0.0.0.0:" << data_port << "\n"
-              << "[Config] mdns    : " << (mdns_enabled ? mdns_name : "disabled") << "\n";
+              << "[Config] mdns    : " << (mdns_enabled ? mdns_name : "disabled") << "\n"
+              << "[Config] set     : " << (allow_set ? "enabled" : "disabled") << "\n";
 
     // ── Servers ───────────────────────────────────────────────────────────────
-    DataServer   data_srv(data_port);
-    StatusServer status_srv(ctrl_port);
+    vehex::HexBus hex_bus;
+    DataServer    data_srv(data_port);
+    StatusServer  status_srv(ctrl_port, &hex_bus, allow_set);
     data_srv.start();
     status_srv.start();
 
@@ -780,8 +1099,12 @@ int main(int argc, char** argv) {
             continue;
         }
         std::cerr << "[Serial] Opened " << device << " @ " << baud << " baud\n";
+        hex_bus.attach(fd);
 
         VeDirectParser parser;
+        parser.on_hex = [&](uint8_t rsp, const std::vector<uint8_t>& data) {
+            hex_bus.on_frame(rsp, data);
+        };
 
         parser.on_frame = [&](const std::map<std::string,std::string>& fields) {
             ++frame_count;
@@ -897,6 +1220,7 @@ int main(int argc, char** argv) {
             }
         }
 
+        hex_bus.detach();
         ::close(fd);
         fd = -1;
         parser.reset();
